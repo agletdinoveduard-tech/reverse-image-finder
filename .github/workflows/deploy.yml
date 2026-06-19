@@ -25,6 +25,10 @@ jobs:
         shell: bash
         run: node patches/upload-fix.cjs
 
+      - name: Check Worker syntax
+        shell: bash
+        run: node --check worker.js
+
       - name: Create Wrangler config from GitHub Secrets
         shell: bash
         run: |
