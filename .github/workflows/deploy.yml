@@ -7,6 +7,7 @@ on:
     paths:
       - "worker.js"
       - "wrangler.toml"
+      - "patches/upload-fix.cjs"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
@@ -19,6 +20,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+
+      - name: Apply upload compatibility patch
+        shell: bash
+        run: node patches/upload-fix.cjs
 
       - name: Create Wrangler config from GitHub Secrets
         shell: bash
