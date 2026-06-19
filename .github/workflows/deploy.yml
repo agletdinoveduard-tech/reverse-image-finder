@@ -1,0 +1,48 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "worker.js"
+      - "wrangler.toml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Worker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Create Wrangler config from GitHub Secrets
+        shell: bash
+        run: |
+          cat > wrangler.toml <<'EOF'
+          name = "reverse-image-finder"
+          main = "worker.js"
+          compatibility_date = "2026-06-19"
+
+          [vars]
+          ALLOWED_ORIGINS = "*"
+
+          [[kv_namespaces]]
+          binding = "TEMP_IMAGES"
+          id = "${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}"
+          EOF
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+          secrets: |
+            SEARCHAPI_KEY
+        env:
+          SEARCHAPI_KEY: ${{ secrets.SEARCHAPI_KEY }}
