@@ -22,12 +22,14 @@
 ## Файлы
 
 ```text
-worker.js                  # основной Cloudflare Worker: frontend + backend
-wrangler.toml.example      # пример конфигурации Wrangler
-index.html                 # простая страница для GitHub Pages
-docs/SETUP_CLOUDFLARE.md   # пошаговая настройка Cloudflare
-docs/SEARCH_ENGINES.md     # список поисковых источников
-docs/TROUBLESHOOTING.md    # ошибки и решения
+worker.js                              # основной Cloudflare Worker: frontend + backend
+.github/workflows/deploy.yml           # автоматический деплой GitHub → Cloudflare
+wrangler.toml.example                  # пример конфигурации Wrangler
+index.html                             # простая страница для GitHub Pages
+docs/SETUP_CLOUDFLARE.md               # пошаговая настройка Cloudflare
+docs/AUTO_DEPLOY_GITHUB_ACTIONS.md     # настройка автоматического деплоя
+docs/SEARCH_ENGINES.md                 # список поисковых источников
+docs/TROUBLESHOOTING.md                # ошибки и решения
 ```
 
 ## Минимальные настройки Cloudflare
@@ -66,6 +68,25 @@ KV namespace: reverse-image-temp-kv
 
 10. Нажми **Deploy**.
 11. Открой Worker по адресу `https://...workers.dev/`.
+
+## Автоматический деплой
+
+В репозиторий добавлен GitHub Actions workflow:
+
+```text
+.github/workflows/deploy.yml
+```
+
+Для работы нужно добавить GitHub Secrets:
+
+```text
+CLOUDFLARE_API_TOKEN
+CLOUDFLARE_ACCOUNT_ID
+CLOUDFLARE_KV_NAMESPACE_ID
+SEARCHAPI_KEY
+```
+
+Подробная инструкция: `docs/AUTO_DEPLOY_GITHUB_ACTIONS.md`.
 
 ## Почему не GitHub Pages
 
