@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reverse Image Finder</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#080b12;color:#ecf2ff}.wrap{width:min(900px,100%);margin:0 auto;padding:28px}.card{border:1px solid rgba(255,255,255,.14);border-radius:24px;padding:24px;background:#101827}a{color:#93c5fd}code{background:#050813;padding:2px 6px;border-radius:6px}li{margin:8px 0}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>Reverse Image Finder</h1>
+      <p>Это репозиторий веб‑программы для обратного поиска изображений.</p>
+      <p><b>Важно:</b> рабочая версия должна запускаться как Cloudflare Worker, потому что GitHub Pages не умеет безопасно хранить API‑ключи и выполнять backend‑код.</p>
+      <h2>Как запустить</h2>
+      <ol>
+        <li>Открой файл <code>worker.js</code>.</li>
+        <li>Скопируй весь код в Cloudflare Worker.</li>
+        <li>Добавь Secret <code>SEARCHAPI_KEY</code>.</li>
+        <li>Создай Workers KV namespace и подключи его как <code>TEMP_IMAGES</code>.</li>
+        <li>Нажми Deploy.</li>
+      </ol>
+      <p>Подробности смотри в <a href="./README.md">README</a> и папке <a href="./docs/SETUP_CLOUDFLARE.md">docs</a>.</p>
+    </section>
+  </main>
+</body>
+</html>
