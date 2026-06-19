@@ -1,0 +1,17 @@
+name = "reverse-image-finder"
+main = "worker.js"
+compatibility_date = "2026-06-19"
+
+# Optional, if you deploy through Wrangler instead of Cloudflare Dashboard.
+# For dashboard setup, add these in Worker Settings.
+
+# [vars]
+# ALLOWED_ORIGINS = "*"
+
+# [[kv_namespaces]]
+# binding = "TEMP_IMAGES"
+# id = "your-kv-namespace-id"
+
+# Secrets must NOT be placed here.
+# Add SEARCHAPI_KEY via Cloudflare Dashboard:
+# Worker → Settings → Variables and Secrets → Add → Secret
