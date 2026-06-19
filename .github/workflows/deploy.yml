@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           cat > wrangler.toml <<'EOF'
-          name = "reverse-image-finder"
+          name = "ai-reverse-image-finder"
           main = "worker.js"
           compatibility_date = "2026-06-19"
 
