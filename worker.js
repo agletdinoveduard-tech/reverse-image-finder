@@ -1,9 +1,9 @@
 /**
  * Reverse Image Finder — Cloudflare Worker
- * Version: v16-stable-buttons-upload
+ * Version: v17-targeted-search
  */
 
-const VERSION = 'v16-stable-buttons-upload';
+const VERSION = 'v17-targeted-search';
 const SEARCHAPI_ENDPOINT = 'https://www.searchapi.io/api/v1/search';
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const MAX_STORE_BYTES = 6 * 1024 * 1024;
@@ -37,7 +37,11 @@ function health(env) {
     hasTempKv: Boolean(env.TEMP_IMAGES),
     tempStorage: 'Workers KV JSON base64',
     required: ['SEARCHAPI_KEY', 'TEMP_IMAGES'],
-    engines: ['yandex_reverse_image', 'google_lens exact_matches', 'google_lens visual_matches', 'google_images fallback']
+    engines: ['yandex_reverse_image', 'google_lens exact_matches', 'google_lens visual_matches', 'google_images fallback'],
+    searchOptions: {
+      focus: ['whole', 'person', 'object'],
+      precision: ['balanced', 'wide', 'exact']
+    }
   };
 }
 
@@ -56,38 +60,88 @@ async function uploadTest(request, env, cors) {
 async function search(request, env, cors) {
   requireBindings(env, true);
   const form = await request.formData();
-  const mode = String(form.get('mode') || 'max');
+  const mode = normalizeChoice(form.get('mode'), ['fast', 'deep', 'max'], 'max');
   const country = String(form.get('country') || 'ru');
+  const focus = normalizeChoice(form.get('focus'), ['whole', 'person', 'object'], 'whole');
+  const precision = normalizeChoice(form.get('precision'), ['balanced', 'wide', 'exact'], 'balanced');
+  const targetText = String(form.get('targetText') || '').trim().slice(0, 120);
+
   const saved = await saveUploadedImage(form, env, request.url);
   await sleep(3500);
 
-  const diagnostics = [{ step: 'image_saved', imageUrl: saved.imageUrl, fileInfo: saved.fileInfo }];
+  const diagnostics = [{ step: 'image_saved', imageUrl: saved.imageUrl, fileInfo: saved.fileInfo, focus, precision, targetText }];
   const collected = [];
   const related = new Set();
   const used = [];
 
   const yandex = await callSearchSafe(env, { engine: 'yandex_reverse_image', url: saved.imageUrl, country, num: '20' }, 'Yandex Reverse Image', diagnostics);
-  if (yandex.ok) { used.push('Yandex Reverse Image'); collectYandex(yandex.data, collected, related); }
+  if (yandex.ok) { used.push('Yandex Reverse Image'); collectYandex(yandex.data, collected, related, precision); }
 
-  if (mode === 'deep' || mode === 'max') {
+  const useLensExact = precision === 'exact' || mode === 'deep' || mode === 'max' || focus === 'person';
+  const useLensVisual = precision !== 'exact' && (mode === 'deep' || mode === 'max' || focus === 'person' || focus === 'object');
+
+  if (useLensExact) {
     const exact = await callSearchSafe(env, { engine: 'google_lens', url: saved.imageUrl, type: 'exact_matches', country, hl: 'ru' }, 'Google Lens Exact', diagnostics);
-    if (exact.ok) { used.push('Google Lens Exact'); collectGoogleLens(exact.data, collected, related, 'точное', 94, 'Google Lens Exact'); }
-
-    const visual = await callSearchSafe(env, { engine: 'google_lens', url: saved.imageUrl, type: 'visual_matches', country, hl: 'ru' }, 'Google Lens Visual', diagnostics);
-    if (visual.ok) { used.push('Google Lens Visual'); collectGoogleLens(visual.data, collected, related, 'похожее', 78, 'Google Lens Visual'); }
+    if (exact.ok) { used.push('Google Lens Exact'); collectGoogleLens(exact.data, collected, related, 'точное', 98, 'Google Lens Exact', true); }
   }
 
-  if (mode === 'max') {
-    const queries = Array.from(related).filter(Boolean).slice(0, 3);
-    for (const q of queries) {
+  if (useLensVisual) {
+    const visualScore = focus === 'object' ? 82 : focus === 'person' ? 84 : 78;
+    const visual = await callSearchSafe(env, { engine: 'google_lens', url: saved.imageUrl, type: 'visual_matches', country, hl: 'ru' }, 'Google Lens Visual', diagnostics);
+    if (visual.ok) { used.push('Google Lens Visual'); collectGoogleLens(visual.data, collected, related, 'похожее', visualScore, 'Google Lens Visual', false); }
+  }
+
+  const fallbackQueries = buildFallbackQueries(related, focus, targetText, precision);
+  if (mode === 'max' && precision !== 'exact' && fallbackQueries.length) {
+    for (const q of fallbackQueries.slice(0, 4)) {
       const g = await callSearchSafe(env, { engine: 'google_images', q, country, hl: 'ru', num: '10' }, 'Google Images: ' + q, diagnostics);
-      if (g.ok) { used.push('Google Images'); collectGoogleImages(g.data, collected, q); }
+      if (g.ok) { used.push('Google Images'); collectGoogleImages(g.data, collected, q, focus); }
     }
   }
 
-  const results = dedupe(collected).slice(0, 80);
-  diagnostics.push({ step: 'done', sourcesUsed: Array.from(new Set(used)), resultCount: results.length });
-  return json({ ok: true, version: VERSION, mode, country, imageUrl: saved.imageUrl, fileInfo: saved.fileInfo, sourcesUsed: Array.from(new Set(used)), total: results.length, results, diagnostics }, 200, cors);
+  const ranked = rankAndFilter(collected, { focus, precision, targetText });
+  diagnostics.push({ step: 'done', sourcesUsed: Array.from(new Set(used)), rawCount: collected.length, resultCount: ranked.length });
+  return json({ ok: true, version: VERSION, mode, country, focus, precision, targetText, imageUrl: saved.imageUrl, fileInfo: saved.fileInfo, sourcesUsed: Array.from(new Set(used)), total: ranked.length, results: ranked, diagnostics }, 200, cors);
+}
+
+function normalizeChoice(value, allowed, fallback) {
+  const v = String(value || '').toLowerCase();
+  return allowed.includes(v) ? v : fallback;
+}
+
+function buildFallbackQueries(related, focus, targetText, precision) {
+  if (precision === 'exact') return [];
+  const result = [];
+  if (targetText) {
+    result.push(targetText);
+    if (focus === 'person') result.push(targetText + ' фото');
+    if (focus === 'object') result.push(targetText + ' изображение');
+  }
+  for (const q of Array.from(related).filter(Boolean)) {
+    if (!result.includes(q)) result.push(q);
+  }
+  return result.slice(0, 6);
+}
+
+function rankAndFilter(items, opts) {
+  const m = new Map();
+  for (const item of items) {
+    if (!item.url) continue;
+    let x = { ...item };
+    if (opts.precision === 'exact' && x.similarity < 92 && x.matchType !== 'точное') continue;
+    if (opts.focus === 'person' && /lens|reverse|size/i.test(x.source)) x.similarity += 2;
+    if (opts.focus === 'object' && /visual|similar|images/i.test(x.source)) x.similarity += 2;
+    if (opts.targetText && containsAny((x.title + ' ' + x.description + ' ' + x.domain).toLowerCase(), opts.targetText.toLowerCase().split(/\s+/))) x.similarity += 4;
+    x.similarity = Math.max(1, Math.min(100, Math.round(x.similarity)));
+    const k = normUrl(x.url);
+    const old = m.get(k);
+    if (!old || x.similarity > old.similarity) m.set(k, x);
+  }
+  return Array.from(m.values()).sort((a, b) => b.similarity - a.similarity).slice(0, 80);
+}
+
+function containsAny(text, words) {
+  return words.filter(w => w && w.length > 2).some(w => text.includes(w));
 }
 
 async function saveUploadedImage(form, env, requestUrl) {
@@ -159,53 +213,43 @@ async function callSearchApi(env, params) {
   return data;
 }
 
-function collectYandex(data, out, related) {
-  arr(data.visual_matches).forEach(x => out.push(normalize(x, 'Yandex Reverse Image', x.exact_match ? 'точное' : 'похожее', x.exact_match ? 96 : 82)));
-  arr(data.similar_images).forEach(x => out.push(normalize(x, 'Yandex Similar Images', 'похожее', 72)));
-  arr(data.image_sizes).forEach(x => out.push(normalize(x, 'Yandex Image Sizes', 'точное', 92)));
+function collectYandex(data, out, related, precision) {
+  arr(data.visual_matches).forEach(x => out.push(normalize(x, 'Yandex Reverse Image', x.exact_match ? 'точное' : 'похожее', x.exact_match ? 98 : 82)));
+  arr(data.similar_images).forEach(x => { if (precision !== 'exact') out.push(normalize(x, 'Yandex Similar Images', 'похожее', 72)); });
+  arr(data.image_sizes).forEach(x => out.push(normalize(x, 'Yandex Image Sizes', 'точное', 99)));
   arr(data.related_searches).forEach(x => { const q = x.query || x.title || x.text; if (q) related.add(String(q)); });
 }
-function collectGoogleLens(data, out, related, type, score, source) {
-  arr(data.exact_matches).forEach(x => out.push(normalize(x, source, 'точное', 96)));
-  arr(data.visual_matches).forEach(x => out.push(normalize(x, source, type, score)));
-  arr(data.related_content).forEach(x => { if (x.query) related.add(String(x.query)); out.push(normalize(x, source + ' Related', 'возможное', 55)); });
+function collectGoogleLens(data, out, related, type, score, source, exactOnly) {
+  arr(data.exact_matches).forEach(x => out.push(normalize(x, source, 'точное', 98)));
+  if (!exactOnly) arr(data.visual_matches).forEach(x => out.push(normalize(x, source, type, score)));
+  if (!exactOnly) arr(data.related_content).forEach(x => { if (x.query) related.add(String(x.query)); out.push(normalize(x, source + ' Related', 'возможное', 55)); });
 }
-function collectGoogleImages(data, out, q) { arr(data.images).forEach(x => out.push(normalize(x, 'Google Images: ' + q, 'возможное', 50))); }
+function collectGoogleImages(data, out, q, focus) { arr(data.images).forEach(x => out.push(normalize(x, 'Google Images: ' + q, focus === 'object' ? 'объект/похожее' : 'возможное', 50))); }
 function normalize(x, source, matchType, score) {
   const url = x.link || x.url || x.source_link || x.page || x.serpapi_link || x.thumbnail || x.image || x.original || x.image_url || '';
   const preview = x.thumbnail || x.image || x.original || x.image_url || '';
   return { title: String(x.title || x.name || domain(url) || 'Найденное изображение'), url: String(url), domain: domain(url), preview: String(preview), similarity: score, matchType, source, description: String(x.snippet || x.description || x.content || '').slice(0, 300) };
 }
-function dedupe(items) {
-  const m = new Map();
-  items.forEach(x => { if (!x.url) return; const k = normUrl(x.url); const old = m.get(k); if (!old || x.similarity > old.similarity) m.set(k, x); });
-  return Array.from(m.values()).sort((a, b) => b.similarity - a.similarity);
-}
 
 function html(cors) {
-  const body = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reverse Image Finder</title><style>*{box-sizing:border-box}body{margin:0;background:#080b12;color:#eef4ff;font-family:system-ui,Segoe UI,Arial,sans-serif}.wrap{width:min(1100px,100%);margin:auto;padding:20px}.box{border:1px solid #263244;border-radius:24px;background:#101827;padding:22px}h1{margin:0 0 8px;font-size:clamp(28px,5vw,48px)}p{color:#b8c4d6}.grid{display:grid;grid-template-columns:1fr 320px;gap:14px}.panel{border:1px solid #263244;border-radius:18px;padding:14px;background:#0b1220}input,select,button{width:100%;border:1px solid #334155;border-radius:13px;padding:13px;background:#111c2e;color:white}button{cursor:pointer;font-weight:800;background:linear-gradient(135deg,#7c3aed,#2563eb)}button.secondary{background:#172337}.status{white-space:pre-wrap;overflow-wrap:anywhere;background:#050813;padding:14px;border-radius:16px;margin-top:14px;color:#c7d2e5}.preview{display:none;max-width:100%;max-height:340px;object-fit:contain;margin-top:12px;border-radius:14px;background:#050813}.actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220;overflow:hidden}.card img{width:100%;height:160px;object-fit:cover;border-radius:12px}.small,.url{font-size:12px;color:#93c5fd;overflow-wrap:anywhere}@media(max-width:780px){.wrap{padding:10px}.grid,.actions{grid-template-columns:1fr}}</style></head><body><main class="wrap"><section class="box"><h1>AI Reverse Image Finder</h1><p>Поиск совпадений и похожих изображений через Yandex Reverse Image, Google Lens и Google Images.</p><div class="grid"><div class="panel"><label>Выбери изображение JPG / PNG / WEBP</label><input id="file" type="file" accept="image/*,.jpg,.jpeg,.png,.webp"><img id="preview" class="preview" alt="preview"><p id="fileInfo" class="small">Файл не выбран.</p></div><div class="panel"><label>Режим</label><select id="mode"><option value="fast">Быстрый</option><option value="deep">Глубокий</option><option value="max" selected>Максимум</option></select><label style="display:block;margin-top:10px">Регион</label><select id="country"><option value="ru" selected>Россия</option><option value="us">США</option><option value="de">Германия</option><option value="at">Австрия</option></select><button id="searchBtn" style="margin-top:10px">Найти изображение</button><button id="uploadBtn" class="secondary" style="margin-top:10px">Проверить загрузку</button><button id="healthBtn" class="secondary" style="margin-top:10px">Проверить настройки</button></div></div><div class="actions"><button id="copyBtn" class="secondary">Копировать ссылки</button><button id="jsonBtn" class="secondary">Экспорт JSON</button><button id="clearBtn" class="secondary">Очистить</button></div><div id="status" class="status">Готово. Выбери изображение.</div><div id="results" class="cards"></div></section></main><script src="/app.js?v=16"></script></body></html>`;
+  const body = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reverse Image Finder</title><style>*{box-sizing:border-box}body{margin:0;background:#080b12;color:#eef4ff;font-family:system-ui,Segoe UI,Arial,sans-serif}.wrap{width:min(1120px,100%);margin:auto;padding:20px}.box{border:1px solid #263244;border-radius:24px;background:#101827;padding:22px}h1{margin:0 0 8px;font-size:clamp(28px,5vw,48px)}p{color:#b8c4d6}.grid{display:grid;grid-template-columns:1fr 360px;gap:14px}.panel{border:1px solid #263244;border-radius:18px;padding:14px;background:#0b1220}label{display:block;margin-bottom:6px;color:#cbd5e1}input,select,button{width:100%;border:1px solid #334155;border-radius:13px;padding:13px;background:#111c2e;color:white}button{cursor:pointer;font-weight:800;background:linear-gradient(135deg,#7c3aed,#2563eb)}button.secondary{background:#172337}.status{white-space:pre-wrap;overflow-wrap:anywhere;background:#050813;padding:14px;border-radius:16px;margin-top:14px;color:#c7d2e5}.preview{display:none;max-width:100%;max-height:340px;object-fit:contain;margin-top:12px;border-radius:14px;background:#050813}.actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220;overflow:hidden}.card img{width:100%;height:160px;object-fit:cover;border-radius:12px}.small,.url{font-size:12px;color:#93c5fd;overflow-wrap:anywhere}.two{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}@media(max-width:780px){.wrap{padding:10px}.grid,.actions,.two{grid-template-columns:1fr}}</style></head><body><main class="wrap"><section class="box"><h1>AI Reverse Image Finder</h1><p>Выбери, что искать: всё изображение, человека, предмет или только абсолютные совпадения.</p><div class="grid"><div class="panel"><label>Изображение JPG / PNG / WEBP</label><input id="file" type="file" accept="image/*,.jpg,.jpeg,.png,.webp"><img id="preview" class="preview" alt="preview"><p id="fileInfo" class="small">Файл не выбран.</p><label style="margin-top:10px">Подсказка для поиска, необязательно</label><input id="targetText" type="text" placeholder="Например: человек, красная сумка, автомобиль, логотип"></div><div class="panel"><label>Что искать</label><select id="focus"><option value="whole" selected>Всё изображение</option><option value="person">Человека / лицо с изображения</option><option value="object">Предмет / объект с изображения</option></select><label style="margin-top:10px">Точность</label><select id="precision"><option value="balanced" selected>Сбалансированно</option><option value="wide">Шире, больше похожих</option><option value="exact">Только абсолютное сходство</option></select><div class="two"><div><label>Режим</label><select id="mode"><option value="fast">Быстрый</option><option value="deep">Глубокий</option><option value="max" selected>Максимум</option></select></div><div><label>Регион</label><select id="country"><option value="ru" selected>Россия</option><option value="us">США</option><option value="de">Германия</option><option value="at">Австрия</option></select></div></div><button id="searchBtn" style="margin-top:10px">Найти изображение</button><button id="uploadBtn" class="secondary" style="margin-top:10px">Проверить загрузку</button><button id="healthBtn" class="secondary" style="margin-top:10px">Проверить настройки</button></div></div><div class="actions"><button id="copyBtn" class="secondary">Копировать ссылки</button><button id="jsonBtn" class="secondary">Экспорт JSON</button><button id="clearBtn" class="secondary">Очистить</button></div><div id="status" class="status">Готово. Выбери изображение.</div><div id="results" class="cards"></div></section></main><script src="/app.js?v=17"></script></body></html>`;
   return new Response(body, { headers: { ...cors, 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
 function appJs(cors) {
   const js = String.raw`(function(){
-var file=document.getElementById('file');
-var preview=document.getElementById('preview');
-var fileInfo=document.getElementById('fileInfo');
-var status=document.getElementById('status');
-var results=document.getElementById('results');
-var mode=document.getElementById('mode');
-var country=document.getElementById('country');
+var file=document.getElementById('file'), preview=document.getElementById('preview'), fileInfo=document.getElementById('fileInfo'), status=document.getElementById('status'), results=document.getElementById('results');
+var mode=document.getElementById('mode'), country=document.getElementById('country'), focus=document.getElementById('focus'), precision=document.getElementById('precision'), targetText=document.getElementById('targetText');
 var last=[];
 function say(t){status.textContent=t;}
 function okFile(f){var n=(f.name||'').toLowerCase();var t=(f.type||'').toLowerCase();if(/\.(heic|heif)$/.test(n)||t.indexOf('heic')>=0||t.indexOf('heif')>=0)return 'HEIC/HEIF не поддерживается. Сохрани как JPG/PNG/WEBP или сделай скриншот.';if(/^image\/(jpeg|png|webp)$/.test(t)||/\.(jpg|jpeg|png|webp)$/.test(n))return '';return 'Нужен JPG, PNG или WEBP. Тип: '+(f.type||'пусто')+', имя: '+(f.name||'без имени');}
 function selected(){return file.files&&file.files[0];}
-file.addEventListener('change',function(){var f=selected();if(!f){fileInfo.textContent='Файл не выбран.';return;}fileInfo.textContent='Файл: '+(f.name||'без имени')+' | '+Math.round(f.size/1024)+' КБ | '+(f.type||'тип не указан');var e=okFile(f);if(e){say(e);return;}try{preview.src=URL.createObjectURL(f);preview.style.display='block';}catch(x){}say('Файл выбран. Можно запускать поиск.');});
-function post(endpoint){var f=selected();if(!f){say('Сначала выбери изображение.');return;}var e=okFile(f);if(e){say(e);return;}if(f.size>10*1024*1024){say('Файл больше 10 МБ. Уменьши изображение.');return;}var fd=new FormData();fd.append('image',f,f.name||'image.jpg');fd.append('mode',mode.value);fd.append('country',country.value);say(endpoint==='/api/upload-test'?'Проверяю загрузку...':'Идёт поиск. Это может занять до минуты...');return fetch(endpoint,{method:'POST',body:fd}).then(function(r){return r.text().then(function(t){var j;try{j=JSON.parse(t);}catch(x){throw new Error('Ответ не JSON: '+t.slice(0,500));}if(!r.ok||!j.ok)throw new Error(j.error||('HTTP '+r.status));return j;});});}
+file.addEventListener('change',function(){var f=selected();if(!f){fileInfo.textContent='Файл не выбран.';return;}fileInfo.textContent='Файл: '+(f.name||'без имени')+' | '+Math.round(f.size/1024)+' КБ | '+(f.type||'тип не указан');var e=okFile(f);if(e){say(e);return;}try{preview.src=URL.createObjectURL(f);preview.style.display='block';}catch(x){}say('Файл выбран. Выбери режим поиска и нажми «Найти изображение».');});
+function post(endpoint){var f=selected();if(!f){say('Сначала выбери изображение.');return Promise.reject(new Error('Файл не выбран'));}var e=okFile(f);if(e){say(e);return Promise.reject(new Error(e));}if(f.size>10*1024*1024){say('Файл больше 10 МБ. Уменьши изображение.');return Promise.reject(new Error('Файл больше 10 МБ'));}var fd=new FormData();fd.append('image',f,f.name||'image.jpg');fd.append('mode',mode.value);fd.append('country',country.value);fd.append('focus',focus.value);fd.append('precision',precision.value);fd.append('targetText',targetText.value||'');say(endpoint==='/api/upload-test'?'Проверяю загрузку...':'Идёт поиск. Это может занять до минуты...');return fetch(endpoint,{method:'POST',body:fd}).then(function(r){return r.text().then(function(t){var j;try{j=JSON.parse(t);}catch(x){throw new Error('Ответ не JSON: '+t.slice(0,500));}if(!r.ok||!j.ok)throw new Error(j.error||('HTTP '+r.status));return j;});});}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function render(items){last=items||[];results.innerHTML='';if(!last.length){results.innerHTML='<div class="card"><h3>Ничего не найдено</h3><p>Попробуй другое изображение или режим Максимум.</p></div>';return;}last.forEach(function(r){var d=document.createElement('div');d.className='card';d.innerHTML=(r.preview?'<img src="'+esc(r.preview)+'" referrerpolicy="no-referrer" loading="lazy">':'')+'<h3>'+esc(r.title)+'</h3><div class="small">'+esc(r.source)+' · '+esc(r.matchType)+' · '+esc(r.similarity)+'%</div><div class="url">'+esc(r.url)+'</div><p>'+esc(r.description)+'</p><a href="'+esc(r.url)+'" target="_blank" rel="noopener"><button>Открыть</button></a>';results.appendChild(d);});}
-document.getElementById('searchBtn').addEventListener('click',function(){post('/api/search').then(function(j){say('Готово. Найдено: '+j.total+'\nИсточники: '+(j.sourcesUsed||[]).join(', ')+'\nДиагностика: '+JSON.stringify(j.diagnostics||[],null,2));render(j.results||[]);}).catch(function(e){say('Ошибка: '+e.message);});});
-document.getElementById('uploadBtn').addEventListener('click',function(){post('/api/upload-test').then(function(j){say('Загрузка работает. Временная ссылка:\n'+j.tempUrl+'\n\n'+JSON.stringify(j.fileInfo,null,2));}).catch(function(e){say('Ошибка загрузки: '+e.message);});});
+function render(items){last=items||[];results.innerHTML='';if(!last.length){results.innerHTML='<div class="card"><h3>Ничего не найдено</h3><p>Попробуй другое изображение, режим «Шире» или подсказку.</p></div>';return;}last.forEach(function(r){var d=document.createElement('div');d.className='card';d.innerHTML=(r.preview?'<img src="'+esc(r.preview)+'" referrerpolicy="no-referrer" loading="lazy">':'')+'<h3>'+esc(r.title)+'</h3><div class="small">'+esc(r.source)+' · '+esc(r.matchType)+' · '+esc(r.similarity)+'%</div><div class="url">'+esc(r.url)+'</div><p>'+esc(r.description)+'</p><a href="'+esc(r.url)+'" target="_blank" rel="noopener"><button>Открыть</button></a>';results.appendChild(d);});}
+document.getElementById('searchBtn').addEventListener('click',function(){post('/api/search').then(function(j){say('Готово. Найдено: '+j.total+'\nФокус: '+j.focus+' | Точность: '+j.precision+'\nИсточники: '+(j.sourcesUsed||[]).join(', ')+'\nДиагностика: '+JSON.stringify(j.diagnostics||[],null,2));render(j.results||[]);}).catch(function(e){if(e.message!=='Файл не выбран')say('Ошибка: '+e.message);});});
+document.getElementById('uploadBtn').addEventListener('click',function(){post('/api/upload-test').then(function(j){say('Загрузка работает. Временная ссылка:\n'+j.tempUrl+'\n\n'+JSON.stringify(j.fileInfo,null,2));}).catch(function(e){if(e.message!=='Файл не выбран')say('Ошибка загрузки: '+e.message);});});
 document.getElementById('healthBtn').addEventListener('click',function(){fetch('/api/health').then(function(r){return r.json();}).then(function(j){say(JSON.stringify(j,null,2));}).catch(function(e){say('Ошибка health: '+e.message);});});
 document.getElementById('copyBtn').addEventListener('click',function(){navigator.clipboard.writeText(last.map(function(x){return x.url;}).join('\n'));say('Скопировано: '+last.length);});
 document.getElementById('jsonBtn').addEventListener('click',function(){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(last,null,2)],{type:'application/json'}));a.download='reverse-image-results.json';a.click();});
